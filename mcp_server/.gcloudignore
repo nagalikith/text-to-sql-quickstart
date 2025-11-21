@@ -1,0 +1,12 @@
+# Ignore everything by default
+*
+
+# Allow Dockerfile and server sources
+!Dockerfile
+!requirements.txt
+!run_mcp_server.py
+
+# Include only DB file we want
+!../data/
+../data/*
+!../data/synthetic_openflights.db

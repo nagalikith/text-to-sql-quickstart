@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+
+# Data and Generated Files
+data/*.dat
+data/*.db
+data/*.json
+data/*.jsonl
+data/*.md
+datasets/*.jsonl
+
+# MCP Server
+mcp_server/__pycache__/

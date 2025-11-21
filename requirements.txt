@@ -1,0 +1,17 @@
+duckdb
+pandas
+pyarrow
+tabulate
+pydantic
+python-dotenv
+jsonlines
+requests
+fireworks-ai
+tqdm
+pytest
+mcp
+mcp-server-motherduck
+uvicorn
+starlette
+openai
+eval-protocol
