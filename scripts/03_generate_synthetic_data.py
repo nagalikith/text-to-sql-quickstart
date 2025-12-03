@@ -1,165 +1,294 @@
 import os
-import time
-import json
-import math
-import uuid
-import decimal
-import datetime
-import pathlib
-from typing import Any, Dict, List, Optional, Type
+import random
+from datetime import datetime, timedelta
+from faker import Faker
+import psycopg2
+import hashlib
+import secrets
 
-import duckdb
-import pandas as pd
-from dotenv import load_dotenv
-from pydantic import BaseModel, create_model
-from fireworks import LLM
+fake = Faker()
 
+# PostgreSQL connection
+conn = psycopg2.connect(
+    dbname="canvas_development",
+    user="postgres",
+    password="sekret",
+    host="localhost",
+    port=5433
+)
+cur = conn.cursor()
 
-def map_sql_type_to_python(sql_type: str) -> Type:
-    s = str(sql_type).upper()
-    if "DECIMAL" in s:
-        return decimal.Decimal
-    if any(k in s for k in ("DOUBLE", "FLOAT", "REAL")):
-        return float
-    if any(k in s for k in ("BIGINT", "INT")):
-        return int
-    if any(k in s for k in ("VARCHAR", "TEXT", "STRING")):
-        return str
-    if "TIMESTAMP" in s:
-        return datetime.datetime
-    if "DATE" in s:
-        return datetime.date
-    if "TIME" in s:
-        return datetime.time
-    if "BOOLEAN" in s:
-        return bool
-    if any(k in s for k in ("BLOB", "BYTEA")):
-        return bytes
-    if "UUID" in s:
-        return uuid.UUID
-    return object
+# Configuration
+NUM_USERS = 50
+NUM_TERMS = 3
+NUM_COURSES_PER_TERM = 10
+NUM_ENROLLMENTS_PER_USER = 3
+ROOT_ACCOUNT_ID = 1
+role_map = {
+    "StudentEnrollment": 3,
+    "TeacherEnrollment": 4,
+    "TaEnrollment": 5,
+    "ObserverEnrollment": 7,
+}
 
+# Password hashing setup
+password = "password123" 
+password_salt = secrets.token_hex(16)
+crypted_password = hashlib.sha512(f"password123{password_salt}".encode()).hexdigest()
+persistence_token = secrets.token_hex(32)
+single_access_token = secrets.token_hex(16)
+perishable_token = secrets.token_hex(16)
+reset_password_token = secrets.token_hex(16)
 
-def main() -> None:
-    load_dotenv()
-    root = pathlib.Path(__file__).resolve().parents[1]
-    data_dir = root / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    prod_db = str(data_dir / "prod_openflights.db")
+# --- Generate Users with Login Credentials ---
+user_ids = []
+for _ in range(NUM_USERS):
+    created_at = fake.date_time_between(start_date="-2y", end_date="now")
+    workflow_state = "active"
+    name = fake.name()
+    first_name = name.split()[0] if name.split() else fake.first_name()
+    last_name = name.split()[-1] if len(name.split()) > 1 else fake.last_name()
+    email = fake.email()
+    sortable_name = f"{last_name}, {first_name}"
+    username = email.split('@')[0] + str(random.randint(100, 999))
+    
+    # Insert into users
+    cur.execute("""
+        INSERT INTO users (workflow_state, created_at, updated_at, root_account_ids, 
+                          name, short_name, sortable_name)
+        VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+    """, [workflow_state, created_at, created_at, [ROOT_ACCOUNT_ID], 
+          name, first_name, sortable_name])
+    user_id = cur.fetchone()[0]
+    user_ids.append(user_id)
+    unique_id_normalized = username.lower()  # Normalize to lowercase
+    
+    # Insert into pseudonyms (login credentials)
+    cur.execute("""
+    INSERT INTO pseudonyms (
+        user_id, account_id, workflow_state, unique_id, 
+        unique_id_normalized,
+        crypted_password, password_salt, 
+        persistence_token, single_access_token, perishable_token,
+        login_count, failed_login_count,
+        created_at, updated_at, sis_user_id,
+        reset_password_token
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+""", [user_id, ROOT_ACCOUNT_ID, "active", username, 
+      unique_id_normalized,
+      crypted_password, password_salt,
+      persistence_token, single_access_token, perishable_token,
+      0, 0,  # login_count, failed_login_count
+      created_at, created_at, f"SIS_{user_id}",
+      reset_password_token])
 
-    with duckdb.connect(prod_db, read_only=True) as con_ro:
-        schema_df = con_ro.sql("DESCRIBE;").df()
-    schema_for_prompt = schema_df.to_markdown(index=False)
+# --- Generate Terms ---
+term_ids = []
+for _ in range(NUM_TERMS):
+    t = fake.date_time_between(start_date="-1y", end_date="now")
+    name = f"Fall {t.year}"
+    start_at = t
+    end_at = t + timedelta(days=120)
+    cur.execute("""
+        INSERT INTO enrollment_terms (root_account_id, created_at, name, start_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s) RETURNING id
+    """, [ROOT_ACCOUNT_ID, t, name, start_at, end_at])
+    term_ids.append(cur.fetchone()[0])
 
-    # Build dynamic Pydantic models per table
-    pydantic_models: Dict[str, Type[BaseModel]] = {}
-    table_names = list(schema_df["name"].unique())
-    for table_name in table_names:
-        row = schema_df[schema_df["name"] == table_name].iloc[0]
-        col_names = list(row["column_names"])
-        col_types = list(row["column_types"])
-        fields: Dict[str, Any] = {}
-        for c, t in zip(col_names, col_types):
-            fields[c] = (Optional[map_sql_type_to_python(t)], None)
-        model_name = f"{table_name.capitalize()}Row"
-        pydantic_models[table_name] = create_model(model_name, **fields)
+# --- Generate Courses ---
+course_ids = []
+for term_id in term_ids:
+    for _ in range(NUM_COURSES_PER_TERM):
+        created_at = fake.date_time_between(start_date="-1y", end_date="now")
+        name = f"{fake.word().title()} {fake.word().title()} {random.randint(100, 999)}"
+        course_code = f"{fake.random_uppercase_letter()}{fake.random_uppercase_letter()}{random.randint(100, 999)}"
+        
+        # Assign a teacher
+        teacher_id = random.choice(user_ids)
+        
+        cur.execute("""
+            INSERT INTO courses (
+                account_id, root_account_id, enrollment_term_id, created_at, updated_at,
+                name, course_code, workflow_state, is_public
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+        """, [ROOT_ACCOUNT_ID, ROOT_ACCOUNT_ID, term_id, created_at, created_at, 
+              name, course_code, "available", False])
+        
+        course_id = cur.fetchone()[0]
+        course_ids.append(course_id)
 
-    dataset_fields: Dict[str, Any] = {t: (List[m], ...) for t, m in pydantic_models.items()}
-    SyntheticDataset = create_model("SyntheticDataset", **dataset_fields)
+# --- Generate Course Sections ---
+section_ids_by_course = {}
+course_default_section_ids = {}  # Track default section for each course
 
-    TARGET_ROW_COUNT = int(os.environ.get("TARGET_ROW_COUNT", "100"))
-    ROWS_PER_API_CALL = int(os.environ.get("ROWS_PER_API_CALL", "2"))
-    TOTAL_ROW_COUNTS = {t: TARGET_ROW_COUNT for t in table_names}
+for course_id in course_ids:
+    # Create 1-3 sections per course
+    num_sections = random.randint(1, 3)
+    section_ids = []
+    
+    for i in range(num_sections):
+        created_at = fake.date_time_between(start_date="-1y", end_date="now")
+        section_name = f"Section {fake.random_uppercase_letter()}" if i == 0 else f"Section {i+1}"
+        section_sis_id = f"SECT_{course_id}_{random.randint(100,999)}"
+        
+        cur.execute("""
+            INSERT INTO course_sections (
+                course_id, name, root_account_id, 
+                created_at, updated_at, sis_source_id,
+                workflow_state, default_section, accepting_enrollments
+            )
+            VALUES (%s, %s, %s, %s,%s, %s, %s, %s, %s)
+            RETURNING id
+        """, [
+            course_id, section_name, ROOT_ACCOUNT_ID,
+            created_at, created_at, section_sis_id,
+            "active", (i == 0), True  # First section is default
+        ])
+        
+        section_id = cur.fetchone()[0]
+        section_ids.append(section_id)
+        
+        if i == 0:  # Store the default section ID
+            course_default_section_ids[course_id] = section_id
+    
+    section_ids_by_course[course_id] = section_ids
 
-    api_key = os.getenv("FIREWORKS_API_KEY")
-    if not api_key:
-        raise RuntimeError("FIREWORKS_API_KEY is not set")
-    llm = LLM(model="accounts/fireworks/models/llama-v3p1-8b-instruct", deployment_type="serverless", api_key=api_key)
+# --- Generate Teacher Enrollments (AFTER sections are created) ---
+# Get teacher for each course and enroll them
+for course_id in course_ids:
+    # Get the default section for this course
+    default_section_id = course_default_section_ids.get(course_id)
+    
+    if not default_section_id:
+        # Fallback to first section if no default found
+        default_section_id = section_ids_by_course[course_id][0]
+    
+    # Find or assign a teacher for this course
+    # (We need to track which user is teacher for each course)
+    # For simplicity, we'll assign a random teacher
+    teacher_id = random.choice(user_ids)
+    
+    created_at = fake.date_time_between(start_date="-1y", end_date="now")
+    
+    # Check if this teacher is already enrolled in this course
+    cur.execute("""
+        SELECT COUNT(*) FROM enrollments 
+        WHERE user_id = %s AND course_id = %s
+    """, [teacher_id, course_id])
+    
+    if cur.fetchone()[0] == 0:
+        cur.execute("""
+            INSERT INTO enrollments (
+                user_id, course_id, type, workflow_state, created_at, updated_at,
+                course_section_id, root_account_id, limit_privileges_to_course_section, role_id
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, [
+            teacher_id, course_id, "TeacherEnrollment", "active",
+            created_at, created_at, default_section_id, ROOT_ACCOUNT_ID, False, role_map["TeacherEnrollment"]
+        ])
 
-    all_synthetic: Dict[str, List[Dict[str, Any]]] = {t: [] for t in table_names}
-    chunk_row_counts = {t: ROWS_PER_API_CALL for t in table_names}
+# --- Generate Student Enrollments ---
+for user_id in user_ids:
+    # Each user enrolls in 1-5 courses
+    num_enrollments = random.randint(1, min(5, len(course_ids)))
+    enrolled_courses = random.sample(course_ids, num_enrollments)
+    
+    for course_id in enrolled_courses:
+        # Skip if user is already teacher of this course
+        cur.execute("""
+            SELECT COUNT(*) FROM enrollments 
+            WHERE user_id = %s AND course_id = %s AND type = 'TeacherEnrollment'
+        """, [user_id, course_id])
+        
+        if cur.fetchone()[0] > 0:
+            continue  # Skip, user is already a teacher in this course
+        
+        # Choose a section for this enrollment
+        section_ids = section_ids_by_course[course_id]
+        section_id = random.choice(section_ids)
+        
+        created_at = fake.date_time_between(start_date="-1y", end_date="now")
+        enrollment_type = "StudentEnrollment"
+        
+        cur.execute("""
+            INSERT INTO enrollments (
+                user_id, course_id, type, workflow_state, created_at, updated_at,
+                course_section_id, root_account_id, limit_privileges_to_course_section, role_id
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, [
+            user_id, course_id, enrollment_type, "active",
+            created_at, created_at, section_id, ROOT_ACCOUNT_ID, False, role_map[enrollment_type]
+        ])
 
-    base_prompt = f"""
-You are a highly capable data generator. Create realistic, consistent synthetic rows for each table.
-Respect referential integrity across tables. Return only JSON conforming to the provided schema.
+# --- Add Some TAs ---
+for _ in range(5):
+    course_id = random.choice(course_ids)
+    user_id = random.choice(user_ids)
+    
+    # Check if user is already enrolled in this course
+    cur.execute("""
+        SELECT COUNT(*) FROM enrollments 
+        WHERE user_id = %s AND course_id = %s AND type IN ('TeacherEnrollment', 'TaEnrollment')
+    """, [user_id, course_id])
+    
+    if cur.fetchone()[0] == 0:
+        section_ids = section_ids_by_course[course_id]
+        section_id = random.choice(section_ids)
+        created_at = fake.date_time_between(start_date="-1y", end_date="now")
+        
+        cur.execute("""
+            INSERT INTO enrollments (
+                user_id, course_id, type, workflow_state, created_at, updated_at,
+                course_section_id, root_account_id, limit_privileges_to_course_section, role_id
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, [
+            user_id, course_id, "TaEnrollment", "active",
+            created_at, created_at, section_id, ROOT_ACCOUNT_ID, False, role_map["TaEnrollment"]
+        ])
 
-Database schema (DuckDB DESCRIBE):
-{schema_for_prompt}
-""".strip()
+# --- Commit and close ---
+conn.commit()
+cur.close()
+conn.close()
 
-    call_count = 0
-    while not all(len(rows) >= TOTAL_ROW_COUNTS[t] for t, rows in all_synthetic.items()):
-        call_count += 1
-        existing_summary = ""
-        if any(all_synthetic[t] for t in table_names):
-            parts = ["Existing recent rows (do not duplicate):"]
-            for t in table_names:
-                rows = all_synthetic[t][-20:]  # recent sample
-                if rows:
-                    df = pd.DataFrame(rows)
-                    if len(df.columns) > 10:
-                        df = df.iloc[:, :10]
-                    parts.append(f"\nTABLE {t}\n{df.to_markdown(index=False)}")
-            existing_summary = "\n".join(parts)
-
-        final_prompt = (
-            base_prompt
-            + "\n"
-            + existing_summary
-            + "\n\nGenerate new rows per table in this shape:\n"
-            + json.dumps(chunk_row_counts, indent=2)
-        )
-
-        resp = llm.chat.completions.create(
-            messages=[{"role": "user", "content": final_prompt}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "SyntheticDataset", "schema": SyntheticDataset.model_json_schema()},
-            },
-            temperature=0.7,
-        )
-        choice = resp.choices[0]
-        content = choice.message.content
-        if not content or choice.finish_reason == "length":
-            print(f"Chunk {call_count}: empty or truncated, skipping")
-            time.sleep(1)
-            continue
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as e:
-            print(f"Chunk {call_count}: JSON parse error {e}")
-            time.sleep(1)
-            continue
-
-        for t, rows in payload.items():
-            if isinstance(rows, list) and t in all_synthetic:
-                all_synthetic[t].extend(rows)
-
-        for t in table_names:
-            print(f"  {t}: {len(all_synthetic[t])}/{TOTAL_ROW_COUNTS[t]}")
-        time.sleep(1)
-
-    # Deduplicate and trim
-    for t in table_names:
-        df = pd.DataFrame(all_synthetic[t]).drop_duplicates()
-        all_synthetic[t] = df.to_dict("records")[: TOTAL_ROW_COUNTS[t]]
-
-    # Write synthetic DB
-    synth_db = str(data_dir / "synthetic_openflights.db")
-    with duckdb.connect(synth_db) as con:
-        for t in table_names:
-            rows = all_synthetic[t]
-            if not rows:
-                continue
-            df = pd.DataFrame(rows)
-            cols = list(schema_df[schema_df["name"] == t].iloc[0]["column_names"])
-            for c in cols:
-                if c not in df.columns:
-                    df[c] = None
-            df = df[cols]
-            con.execute(f'CREATE OR REPLACE TABLE "{t}" AS SELECT * FROM df')
-    print(f"Synthetic DB written to: {synth_db}")
-
-
-if __name__ == "__main__":
-    main()
+print(f"✅ Generated:")
+print(f"   - {NUM_USERS} users with login credentials")
+print(f"   - {NUM_TERMS} enrollment terms")
+print(f"   - {len(course_ids)} courses")
+print(f"   - {sum(len(sections) for sections in section_ids_by_course.values())} course sections")
+print(f"   - Multiple enrollments (students, teachers, TAs)")
+print("\n📊 Query for People Page:")
+print("""SELECT 
+    u.id AS user_id,
+    u.name,
+    u.email,
+    p.unique_id AS login_username,
+    p.sis_user_id,
+    cc.path AS contact_email,
+    COUNT(DISTINCT e.course_id) AS courses_count
+FROM users u
+LEFT JOIN pseudonyms p ON p.user_id = u.id
+LEFT JOIN communication_channels cc ON cc.user_id = u.id AND cc.path_type = 'email'
+LEFT JOIN enrollments e ON e.user_id = u.id AND e.workflow_state = 'active'
+GROUP BY u.id, u.name, u.email, p.unique_id, p.sis_user_id, cc.path
+ORDER BY u.name;""")
+print("\n📊 Query for Courses Page:")
+print("""SELECT 
+    c.id AS course_id,
+    c.name AS course_name,
+    c.course_code,
+    et.name AS term,
+    u.name AS teacher,
+    COUNT(DISTINCT e.user_id) AS student_count
+FROM courses c
+LEFT JOIN enrollment_terms et ON et.id = c.enrollment_term_id
+LEFT JOIN enrollments e ON e.course_id = c.id AND e.type = 'StudentEnrollment' AND e.workflow_state = 'active'
+LEFT JOIN enrollments te ON te.course_id = c.id AND te.type = 'TeacherEnrollment'
+LEFT JOIN users u ON u.id = te.user_id
+GROUP BY c.id, c.name, c.course_code, et.name, u.name
+ORDER BY c.name;""")

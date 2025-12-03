@@ -6,7 +6,7 @@ install:
 	$(PIP) install -r requirements.txt
 
 .PHONY: all-data
-all-data: sim-prod extract-schema synth gen-queries augment ground-truth gen-nl
+all-data: extract-schema synth gen-queries augment ground-truth gen-nl
 
 .PHONY: sim-prod
 sim-prod:

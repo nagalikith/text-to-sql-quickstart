@@ -1,76 +1,140 @@
 import os
-import time
 import json
-import pathlib
-from typing import List
-
-import duckdb
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+import psycopg2
+from psycopg2.extras import DictCursor
 from fireworks import LLM
 
+# ----------------------------------------------------------
+# DB CONNECTION
+# ----------------------------------------------------------
+def get_conn():
+    return psycopg2.connect(
+        host="localhost",
+        port=5432,
+        user="postgres",
+        password="postgres",
+        dbname="canvas_lms"
+    )
 
-class SqlQueryBatch(BaseModel):
-    queries: List[str] = Field(description="List of SQL queries")
+# ----------------------------------------------------------
+# SCHEMA EXTRACTION
+# ----------------------------------------------------------
+TARGET_TABLES = {
+    "courses",
+    "course_sections",
+    "course_section_enrollments",
+    "enrollments",
+    "users",
+    "learning_outcomes",
+    "learning_outcome_results",
+    "outcome_proficiencies",
+    "outcome_result_rollups",
+    "assignments",
+    "submissions"
+}
+
+def extract_schema(conn):
+    cur = conn.cursor(cursor_factory=DictCursor)
+
+    cur.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema='public';
+    """)
+
+    tables = [row["table_name"] for row in cur.fetchall()]
+    tables = [t for t in tables if t in TARGET_TABLES]
+
+    schema = {}
+
+    for tbl in tables:
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s;
+        """, (tbl,))
+        cols = [{"name": r["column_name"], "type": r["data_type"]} for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT 
+                kcu.column_name AS fk_column,
+                ccu.table_name AS ref_table,
+                ccu.column_name AS ref_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name
+            WHERE tc.table_name=%s AND tc.constraint_type='FOREIGN KEY';
+        """, (tbl,))
+        fks = [{
+            "column": r["fk_column"],
+            "ref_table": r["ref_table"],
+            "ref_column": r["ref_column"]
+        } for r in cur.fetchall()]
+
+        schema[tbl] = {"columns": cols, "foreign_keys": fks}
+
+    return schema
+# ----------------------------------------------------------
+# LLM SQL GENERATION
+# ----------------------------------------------------------
+def generate_sql_queries(llm, schema_md, num_queries=20):
+    prompt = f"""
+You are an expert SQL generator. Using the following PostgreSQL schema:
+
+{schema_md}
+
+Generate {num_queries} realistic, diverse SQL queries for analytics and reporting.
+
+Rules:
+- Use joins when appropriate.
+- Use WHERE filters, GROUP BY, ORDER BY.
+- Use aggregates like COUNT, AVG, SUM.
+- Use realistic column values (e.g., timestamps, ids, statuses).
+- Use subqueries, windows, and nested SELECTs occasionally.
+- The queries must be valid PostgreSQL.
+
+Return ONLY a JSON array of SQL strings.
+"""
+
+    resp = llm.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.6,
+        response_format={"type": "json_object"}
+    )
+
+    return json.loads(resp.choices[0].message.content)
 
 
-def main() -> None:
-    load_dotenv()
-    root = pathlib.Path(__file__).resolve().parents[1]
-    data_dir = root / "data"
-    synth_db = str(data_dir / "synthetic_openflights.db")
-    out_path = data_dir / "generated_queries.json"
+# ----------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------
+def main():
     api_key = os.getenv("FIREWORKS_API_KEY")
     if not api_key:
-        raise RuntimeError("FIREWORKS_API_KEY is not set")
+        raise RuntimeError("FIREWORKS_API_KEY missing")
 
-    llm = LLM(model="accounts/fireworks/models/llama-v3p1-8b-instruct", deployment_type="serverless", api_key=api_key)
-    TOTAL = int(os.environ.get("TOTAL_QUERIES", "500"))
-    BATCH = int(os.environ.get("QUERIES_PER_API_CALL", "30"))
+    llm = LLM(
+        model="accounts/fireworks/models/llama-v3p1-8b-instruct",
+        deployment_type="serverless",
+        api_key=api_key,
+    )
 
-    with duckdb.connect(synth_db, read_only=True) as con:
-        schema_df = con.sql("DESCRIBE;").df()
-    schema_md = schema_df.to_markdown(index=False)
+    conn = get_conn()
+    schema = extract_schema(conn)
 
-    base_prompt = f"""
-You are an expert SQL analyst. Generate diverse DuckDB-valid SQL queries across the schema.
-Cover joins, groups, aggregates, and ensure deterministic ordering where applicable.
-Avoid duplicate rows; group appropriately. Output only queries in JSON schema.
+    # Pretty markdown version for LLM
+    schema_md = json.dumps(schema, indent=2)
 
-Schema:
-{schema_md}
-""".strip()
+    output = generate_sql_queries(llm, schema_md, num_queries=50)
 
-    all_q: List[str] = []
-    while len(all_q) < TOTAL:
-        existing = ""
-        if all_q:
-            existing = "Existing queries:\n" + "\n".join(f"{i + 1}. {q}" for i, q in enumerate(all_q[-100:]))
-        prompt = base_prompt + "\n" + existing + f"\nGenerate {BATCH} new, unique queries as JSON."
-        resp = llm.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "SqlQueryBatch", "schema": SqlQueryBatch.model_json_schema()},
-            },
-            temperature=0.8,
-        )
-        content = resp.choices[0].message.content
-        if not content:
-            time.sleep(1)
-            continue
-        try:
-            new_q = json.loads(content).get("queries", [])
-        except Exception:
-            new_q = []
-        all_q.extend(new_q)
-        print(f"Got {len(new_q)} queries; total {len(all_q)}/{TOTAL}")
-        time.sleep(1)
+    # Save to JSONL for RLFT pipeline
+    with open("generated_sql_queries.jsonl", "w") as f:
+        for q in output["queries"]:
+            f.write(json.dumps({"query": q}) + "\n")
 
-    # Dedup preserve order
-    unique = list(dict.fromkeys(all_q))[:TOTAL]
-    out_path.write_text(json.dumps({"queries": unique}, indent=2))
-    print(f"Wrote {len(unique)} queries to {out_path}")
+    print("Generated SQL queries saved to generated_sql_queries.jsonl")
 
 
 if __name__ == "__main__":
